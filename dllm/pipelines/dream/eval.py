@@ -1,13 +1,12 @@
 """
 accelerate launch \
-    --num_processes 2 \
+    --num_processes 4 \
     dllm/pipelines/dream/eval.py \
-    --tasks gsm8k \
-    --batch_size 1 \
+    --tasks gsm8k_cot \
     --model dream \
-    --device cuda
+    --apply_chat_template \
     --num_fewshot 0 \
-    --model_args "pretrained=Dream-org/Dream-v0-Base-7B,mc_num=1,max_new_tokens=512,max_length=512,steps=512,temperature=0.2,top_p=0.95,add_bos_token=true,escape_until=true"
+    --model_args "pretrained=Dream-org/Dream-v0-Instruct-7B,max_new_tokens=256,steps=256,temperature=0.1,top_p=0.9,alg=entropy,dtype=bfloat16,add_bos_token=False,escape_until=False"
 """
 
 import logging
@@ -26,17 +25,17 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import get_dtype
 
 import dllm
-from dllm.pipelines.dream import DreamGenerator, DreamGeneratorConfig
+from dllm.pipelines.dream import DreamSampler, DreamSamplerConfig
 
 eval_logger = logging.getLogger(__name__)
 
 
 @dataclass
-class DreamEvalConfig(DreamGeneratorConfig):
+class DreamEvalConfig(DreamSamplerConfig):
     top_p: float | None = None
     top_k: float | None = None
     max_new_tokens: int = 128
-    max_length: int = 2048
+    max_length: int = 4096
     steps: int = 128
     temperature: float = 0.0
     alg: str = "entropy"
@@ -125,7 +124,7 @@ class DreamEvalHarness(LM):
             SimpleNamespace(model_name_or_path=pretrained, model=self.model)
         )
 
-        # generation params
+        # sampling params
         self.mask_id = self.tokenizer.mask_token_id
         self.max_length = max_length
         self.add_bos_token = add_bos_token
@@ -191,7 +190,7 @@ class DreamEvalHarness(LM):
             disable=(disable_tqdm or (self.rank != 0)),
             desc="Running generate_until requests",
         )
-        generator = DreamGenerator(model=self.model, tokenizer=self.tokenizer)
+        sampler = DreamSampler(model=self.model, tokenizer=self.tokenizer)
         for batch_idx in range(0, len(requests), self.batch_size):
             batch_requests = requests[batch_idx : batch_idx + self.batch_size]
             contexts, gen_args = zip(*[req.arguments for req in batch_requests])
@@ -219,7 +218,7 @@ class DreamEvalHarness(LM):
                 prompt_ids = [p_id[-cutoff_len:] for p_id in prompt_ids]
 
             # generation
-            generation_ids = generator.generate(
+            generation_ids = sampler.sample(
                 max_new_tokens=self.max_new_tokens,
                 inputs=prompt_ids,
                 steps=self.steps,
@@ -229,7 +228,7 @@ class DreamEvalHarness(LM):
                 alg=self.alg,
                 alg_temp=self.alg_temp,
                 output_history=False,
-                return_dict_in_generate=False,
+                return_dict=False,
             )
             # decode and cleanup
             cleaned_generation_ids = [
@@ -244,7 +243,7 @@ class DreamEvalHarness(LM):
                 seq[prompt_lens[i] :] for i, seq in enumerate(cleaned_generation_ids)
             ]
             responses = [
-                g.lstrip("<|endoftext|>").split(self.tokenizer.eos_token, 1)[0]
+                g.removeprefix("<|endoftext|>").split(self.tokenizer.eos_token, 1)[0]
                 for g in self.tokenizer.batch_decode(truncated_generation_ids)
             ]
 

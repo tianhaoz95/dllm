@@ -1,13 +1,12 @@
 """
 accelerate launch \
-    --num_processes 2 \
+    --num_processes 4 \
     dllm/pipelines/bert/eval.py \
-    --tasks gsm8k \
-    --batch_size 1 \
+    --tasks gsm8k_bert \
     --model bert \
-    --device cuda \
-    --num_fewshot 8 \
-    --model_args "pretrained=dllm-collection/ModernBERT-base-chat-v0,is_check_greedy=False,mc_num=1,max_new_tokens=1024,steps=1024,block_length=32,cfg=0.0"
+    --apply_chat_template \
+    --num_fewshot 0 \
+    --model_args "pretrained=dllm-collection/ModernBERT-base-chat-v0.1,max_new_tokens=256,steps=256,block_size=32"
 """
 
 from types import SimpleNamespace
@@ -25,21 +24,21 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import get_dtype
 
 import dllm
-from dllm.pipelines.llada import LLaDAGenerator, LLaDAGeneratorConfig
+from dllm.core.samplers import MDLMSampler, MDLMSamplerConfig
 
 
 @dataclass
-class BERTEvalConfig(LLaDAGeneratorConfig):
+class BERTEvalConfig(MDLMSamplerConfig):
     max_new_tokens: int = 128
     max_length: int = 512
     steps: int = 128
-    block_length: int = 128
+    block_size: int = 128
 
     pretrained: str = ""
     dtype: str | torch.dtype = "auto"
     batch_size: int = 32
     mc_num: int = 128
-    is_check_greedy: bool = True
+    is_check_greedy: bool = False
     device: str = "cuda"
 
 
@@ -66,7 +65,7 @@ class BERTEvalHarness(LM):
         cfg = kwargs.get("cfg", config.cfg_scale)
         steps = kwargs.get("steps", config.steps)
         max_new_tokens = kwargs.get("max_new_tokens", config.max_new_tokens)
-        block_length = kwargs.get("block_length", config.block_length)
+        block_size = kwargs.get("block_size", config.block_size)
         max_length = kwargs.get("max_length", config.max_length)
         remasking = kwargs.get("remasking", config.remasking)
 
@@ -105,12 +104,12 @@ class BERTEvalHarness(LM):
             SimpleNamespace(model_name_or_path=pretrained, model=self.model)
         )
 
-        # generation params
+        # sampler params
         self.mask_id = self.tokenizer.mask_token_id
         self.batch_size = int(batch_size)
         self.max_length = int(max_length)
         self.max_new_tokens = int(max_new_tokens)
-        self.block_length = int(block_length)
+        self.block_size = int(block_size)
         self.steps = int(steps)
         self.cfg = float(cfg)
         self.remasking = remasking
@@ -324,16 +323,16 @@ class BERTEvalHarness(LM):
         ds = ds.with_format("torch")
 
         out = []
-        generator = LLaDAGenerator(model=self.model, tokenizer=self.tokenizer)
+        sampler = MDLMSampler(model=self.model, tokenizer=self.tokenizer)
 
         for elem in tqdm(ds, desc="Generating..."):
             prompt = [elem["question"][1:-1].to(self.device)]
             stop_tokens = elem["until"]
-            generated_ids = generator.generate(
+            generated_ids = sampler.sample(
                 inputs=prompt,
                 steps=self.steps,
                 max_new_tokens=self.max_new_tokens,
-                block_length=self.block_length,
+                block_size=self.block_size,
                 temperature=0.0,
                 cfg_scale=self.cfg,
                 remasking=self.remasking,
@@ -341,7 +340,6 @@ class BERTEvalHarness(LM):
             generated_answer = self.tokenizer.decode(
                 generated_ids[0][prompt[0].shape[0] :], skip_special_tokens=False
             )
-            breakpoint()
             for stop_seq in stop_tokens:
                 if stop_seq in generated_answer:
                     generated_answer = generated_answer.split(stop_seq)[0]

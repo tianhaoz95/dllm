@@ -35,6 +35,7 @@ import transformers
 import accelerate
 
 import dllm
+
 logger = dllm.utils.get_default_logger(__name__)
 
 
@@ -55,7 +56,7 @@ class DataArguments(dllm.utils.DataArguments):
 
 @dataclass
 class TrainingArguments(dllm.utils.TrainingArguments):
-    output_dir: str = "models/LLaDA-8B-SFT/tulu-3-sft-mixture[train:10000,test:1000]"
+    output_dir: str = "models/LLaDA-8B-Base/tulu-3-sft-mixture[train:10000,test:1000]"
     group_by_length: bool = True
 
 
@@ -81,7 +82,7 @@ def train():
         )
         if not data_args.load_preprocessed_data:
             map_fn = partial(
-                dllm.utils.default_sft_map_fn,
+                dllm.utils.default_mdlm_sft_map_fn,
                 tokenizer=tokenizer,
                 mask_prompt_loss=data_args.mask_prompt_loss,
             )
@@ -102,11 +103,15 @@ def train():
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("test", None),
         args=training_args,
-        data_collator=dllm.utils.NoAttentionMaskCollator(
-            tokenizer,
-            return_tensors="pt",
-            padding=True,
-            label_pad_token_id=tokenizer.pad_token_id,  # finetune on padding <eos_token>
+        data_collator=(
+            dllm.utils.NoAttentionMaskWrapper(  # padded <eos_token> should be visible
+                transformers.DataCollatorForSeq2Seq(
+                    tokenizer,
+                    return_tensors="pt",
+                    padding=True,
+                    label_pad_token_id=tokenizer.pad_token_id,  # finetune on padded <eos_token>
+                ),
+            )
         ),
     )
     trainer.train()

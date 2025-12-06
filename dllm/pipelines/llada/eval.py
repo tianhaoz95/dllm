@@ -1,11 +1,12 @@
 """
 accelerate launch \
-    --num_processes 2 \
+    --num_processes 4 \
     dllm/pipelines/llada/eval.py \
-    --tasks gsm8k \
+    --tasks gsm8k_cot \
     --model llada \
-    --num_fewshot 8 \
-    --model_args "pretrained=GSAI-ML/LLaDA-8B-Base,is_check_greedy=False,mc_num=1,max_new_tokens=1024,steps=1024,block_length=32,cfg=0.0"
+    --apply_chat_template \
+    --num_fewshot 5 \
+    --model_args "pretrained=GSAI-ML/LLaDA-8B-Instruct,max_new_tokens=512,steps=512,block_size=512,cfg=0.0,logits_eos_inf=False,confidence_eos_eot_inf=True"
 """
 
 from types import SimpleNamespace
@@ -23,26 +24,43 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import get_dtype
 
 import dllm
-from dllm.pipelines.llada import LLaDAGenerator, LLaDAGeneratorConfig
+from dllm.core.samplers import MDLMSampler, MDLMSamplerConfig
 
 
 @dataclass
-class LLaDAEvalConfig(LLaDAGeneratorConfig):
+class LLaDAEvalConfig(MDLMSamplerConfig):
+    # According to LLaDA's opencompass implementation: https://github.com/ML-GSAI/LLaDA/blob/main/opencompass/opencompass/models/dllm.py
     max_new_tokens: int = 1024
     max_length: int = 4096
     steps: int = 1024
-    block_length: int = 1024
+    block_size: int = 1024
 
     pretrained: str = ""
     dtype: str | torch.dtype = "auto"
     batch_size: int = 32
     mc_num: int = 128
-    is_check_greedy: bool = True
+    is_check_greedy: bool = False
     device: str = "cuda"
 
 
 @register_model("llada")
 class LLaDAEvalHarness(LM):
+    @staticmethod
+    def _parse_token_list(value):
+        """Parse token list from string format like '[126081;126348]' or list."""
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith("[") and value.endswith("]"):
+                value = value[1:-1]  # Remove brackets
+            if not value:  # Empty string after removing brackets
+                return []
+            return [int(x.strip()) for x in value.split(";") if x.strip()]
+        elif isinstance(value, list):
+            return value
+        elif value is None:
+            return []
+        return []
+
     def __init__(
         self,
         config: LLaDAEvalConfig | None = None,
@@ -62,9 +80,16 @@ class LLaDAEvalHarness(LM):
         cfg = kwargs.get("cfg", config.cfg_scale)
         steps = kwargs.get("steps", config.steps)
         max_new_tokens = kwargs.get("max_new_tokens", config.max_new_tokens)
-        block_length = kwargs.get("block_length", config.block_length)
+        block_size = kwargs.get("block_size", config.block_size)
         max_length = kwargs.get("max_length", config.max_length)
         remasking = kwargs.get("remasking", config.remasking)
+        suppress_tokens = self._parse_token_list(
+            kwargs.get("suppress_tokens", config.suppress_tokens)
+        )
+        begin_suppress_tokens = self._parse_token_list(
+            kwargs.get("begin_suppress_tokens", config.begin_suppress_tokens)
+        )
+        right_shift_logits = kwargs.get("right_shift_logits", config.right_shift_logits)
 
         accelerator = accelerate.Accelerator()
 
@@ -101,16 +126,19 @@ class LLaDAEvalHarness(LM):
             SimpleNamespace(model_name_or_path=pretrained, model=self.model)
         )
 
-        # generation params
+        # sampler params
         self.mask_id = self.tokenizer.mask_token_id
         self.batch_size = int(batch_size)
         self.max_length = max_length
         self.max_new_tokens = int(max_new_tokens)
-        self.block_length = int(block_length)
+        self.block_size = int(block_size)
         self.steps = int(steps)
         self.cfg = float(cfg)
         self.remasking = remasking
         self.is_check_greedy = is_check_greedy
+        self.suppress_tokens = suppress_tokens
+        self.begin_suppress_tokens = begin_suppress_tokens
+        self.right_shift_logits = right_shift_logits
 
         # loglikelihood params
         self.mc_num = int(mc_num)
@@ -320,19 +348,22 @@ class LLaDAEvalHarness(LM):
         ds = ds.with_format("torch")
 
         out = []
-        generator = LLaDAGenerator(model=self.model, tokenizer=self.tokenizer)
+        sampler = MDLMSampler(model=self.model, tokenizer=self.tokenizer)
 
         for elem in tqdm(ds, desc="Generating..."):
             prompt = [elem["question"].to(self.device)]
             stop_tokens = elem["until"]
-            generated_ids = generator.generate(
+            generated_ids = sampler.sample(
                 inputs=prompt,
                 steps=self.steps,
                 max_new_tokens=self.max_new_tokens,
-                block_length=self.block_length,
+                block_size=self.block_size,
                 temperature=0.0,
                 cfg_scale=self.cfg,
                 remasking=self.remasking,
+                suppress_tokens=self.suppress_tokens,
+                begin_suppress_tokens=self.begin_suppress_tokens,
+                right_shift_logits=self.right_shift_logits,
             )
             generated_answer = self.tokenizer.decode(
                 generated_ids[0][prompt[0].shape[0] :], skip_special_tokens=False

@@ -6,23 +6,23 @@ Local users
         --config_file scripts/accelerate_configs/ddp.yaml --num_processes 1 \
         examples/bert/sft.py
     
-- 8 GPUs (DDP):
+- 8 GPUs (ZeRO-2):
     accelerate launch \
-        --config_file scripts/accelerate_configs/ddp.yaml \
+        --config_file scripts/accelerate_configs/zero2.yaml \
         examples/bert/sft.py
 
 Slurm users
 # Note: run `mkdir logs` before running sbatch; and adjust 
 #       `partition` and `quotatype` in `scripts/train.slurm.sh` for your cluster.
 ------------
-- 1 Node, 8 GPUs (DDP):
+- 1 Node, 8 GPUs (ZeRO-2):
     sbatch --gres=gpu:8 scripts/train.slurm.sh \
-        --accelerate_config "ddp" \
+        --accelerate_config "zero2" \
         --script_path "examples/bert/sft.py"
 
-- 2 Nodes, 16 GPUs (DDP):
+- 2 Nodes, 16 GPUs (ZeRO-2):
     sbatch --nodes=2 --gres=gpu:8 scripts/train.slurm.sh \
-        --accelerate_config "ddp" \
+        --accelerate_config "zero2" \
         --script_path "examples/bert/sft.py"
 """
 
@@ -60,8 +60,8 @@ class TrainingArguments(dllm.utils.TrainingArguments):
     group_by_length: bool = True
     learning_rate: float = 1e-4
     num_train_epochs: int = 20
-    per_device_train_batch_size: int = 64
-    per_device_eval_batch_size: int = 64
+    per_device_train_batch_size: int = 16
+    per_device_eval_batch_size: int = 16
     eval_steps: float = 0.1
     save_steps: float = 0.1
 
@@ -88,7 +88,7 @@ def train():
         )
         if not data_args.load_preprocessed_data:
             map_fn = partial(
-                dllm.utils.default_sft_map_fn,
+                dllm.utils.default_mdlm_sft_map_fn,
                 tokenizer=tokenizer,
                 mask_prompt_loss=data_args.mask_prompt_loss,
             )
@@ -109,11 +109,15 @@ def train():
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("test", None),
         args=training_args,
-        data_collator=dllm.utils.NoAttentionMaskCollator(
-            tokenizer,
-            return_tensors="pt",
-            padding=True,
-            label_pad_token_id=tokenizer.pad_token_id,  # finetune on padding <eos_token>
+        data_collator=(
+            dllm.utils.NoAttentionMaskWrapper(  # padded <eos_token> should be visible
+                transformers.DataCollatorForSeq2Seq(
+                    tokenizer,
+                    return_tensors="pt",
+                    padding=True,
+                    label_pad_token_id=tokenizer.pad_token_id,  # finetune on padded <eos_token>
+                ),
+            )
         ),
     )
     trainer.train()
